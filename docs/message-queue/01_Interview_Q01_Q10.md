@@ -1,462 +1,539 @@
-# Kafka 4.3.x + RocketMQ 5.5 企业级消息队列教材：Q01～Q10
+# 第 1 课：Q01～Q10——从会说“解耦异步削峰”到真正看懂 Kafka
 
-## Q01. 什么是消息队列？一条消息经历哪些阶段？
-
-**题目定位**：核心面试题｜简单｜频率 ⭐⭐⭐⭐⭐
-
-### 为什么现在问这道题？
-
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
-
-### 2～3 分钟优秀回答
-
-**结论先行。** 消息队列不是简单的 Java `Queue`，而是生产者与消费者之间的独立通信和存储系统。完整链路包括业务创建消息、Producer 发送、Broker 接收与持久化、Topic/Partition 路由、Consumer Group 拉取、业务处理、确认或提交 Offset。它解决的是跨进程、跨时间的可靠传递问题。
-
-以 NexusAgent 文档入库为例，API 接到请求后先在 MySQL 创建 `document_version` 和 `outbox_event`，Relay 再把 `DocumentImportRequested` 发到 Kafka。Broker 把记录追加到某个 Partition，Ingestion Worker 所在消费组读取并执行解析、分块和 Embedding，业务事务成功后提交 Offset。这里必须区分 Broker ACK、业务提交和 Offset 提交：Broker 收到不代表向量已经写完，Offset 提交也不等于所有外部副作用都正确。
-
-MQ 通常带来解耦、异步和削峰，但代价是最终一致、重复、乱序、积压与运维复杂度。因此我不会把 MQ 描述为“转发器就结束”，而会说明消息身份、存储位置、确认时点、失败窗口和恢复者。面试官继续追问时，我会沿 Producer、Broker、Consumer 三段解释不丢消息，再用 Outbox/Inbox 解释跨数据库的一致性。
-
-### 可读但会制造事故的 Java 反例
-
-```java
-// 反例：只在本进程异步，Pod 重启后任务直接丢失。
-@PostMapping("/import")
-public String importDoc(String documentId) {
-    executor.submit(() -> parseAndEmbed(documentId));
-    return "accepted";
-}
-```
-
-### 企业级改进代码
-
-```java
-// 改进：先在同一数据库事务中保存业务事实与事件意图。
-@Transactional
-public String importDoc(String documentId) {
-    String eventId = UUID.randomUUID().toString();
-    documentRepository.createVersion(documentId);
-    outboxRepository.insert(eventId, "DocumentImportRequested", documentId);
-    return eventId; // 后续由 Outbox Relay 可靠发布
-}
-```
-
-### 面试官递进追问
-
-1. Broker ACK 能证明什么？
-2. 为什么提交 Offset 不会删除 Kafka 消息？
-
-### 复习记忆钩子
-
-**先有业务事实，再有消息；消息可重投，业务身份不可重建。**
+> 学习规则：先读“先听懂”，能够复述后再看 2～3 分钟回答。不要直接背最后一段。
 
 ---
 
-## Q02. 为什么使用 MQ？解耦、异步、削峰如何落到项目？
+## Q01. 什么是消息队列？一条消息经历哪些步骤？
 
-**题目定位**：高频面试题｜简单｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：核心题｜简单｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：面试官不是只想听“MQ 是中间件”
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+他想确认你是否知道一条消息经过了哪些角色，以及每个角色的“成功”是不是同一件事。
+
+用订单支付消息走一遍：
+
+```text
+订单服务创建 PaymentConfirmed
+        ↓
+Producer 把消息发给 Kafka
+        ↓
+Broker 把消息写进 Topic 的某个 Partition
+        ↓
+积分 Consumer 拉取消息
+        ↓
+积分数据库更新成功
+        ↓
+Consumer 提交 Offset
+```
+
+这里至少有四个不同的成功：
+
+1. 订单数据库成功；
+2. Kafka 发送成功；
+3. Broker 存储成功；
+4. 消费者业务成功。
+
+其中任何一个成功，都不能证明其他阶段也成功。
+
+### 常见错误
+
+- 把消息队列说成 Java 内存队列；
+- 认为 Producer 收到 ACK 后，下游业务已经完成；
+- 认为 Consumer 收到消息就等于处理成功；
+- 认为提交 Offset 后 Kafka 立即删除消息。
+
+### 项目小例子
+
+文档入库接口不能只把任务扔到本地线程池：Pod 重启后任务会消失。更可靠的做法是记录任务，再通过 Kafka 交给 Worker。
+
+```java
+// 只能算进程内异步，应用重启后可能丢任务。
+executor.submit(() -> parseDocument(documentId));
+```
 
 ### 2～3 分钟优秀回答
 
-使用 MQ 通常有三个目标。第一是**解耦**：订单或 Agent Control Service 只发布领域事件，不直接依赖短信、审计、评估等所有下游。第二是**异步**：把非必要同步完成的解析、Embedding、评估、通知移出 HTTP 主链路，先返回稳定的 `runId`。第三是**削峰**：突发请求进入 Broker 后，下游按可承受并发消费，避免瞬时压垮 MySQL、Milvus 或模型服务。
+“消息队列是位于生产者和消费者之间的独立通信与存储系统。它和 Java 内存 Queue 的区别是，MQ 可以跨进程、跨机器持久化消息，并支持消费进度、副本、重试和扩容。
 
-但三点都要带边界。解耦不是没有契约，消息 Schema、版本和责任人仍是耦合点；异步不是天然更快，它只是把等待时间从请求线程转成后台完成时间；削峰不是消除压力，而是把压力转成积压和时间债务。项目中我会用 Lag、最老消息年龄和净追赶速率证明系统能否在 SLO 内恢复。
+一条消息通常先由业务系统创建，Producer 指定 Topic 和 Key 发送到 Broker，Broker 把它追加到某个 Partition 并按配置复制，Consumer Group 中负责该 Partition 的 Consumer 再拉取消息、执行业务，成功后提交 Offset。
 
-NexusAgent 中，提交 Run 的接口只完成鉴权、幂等校验、MySQL 状态和 Outbox，解析与工具后处理进入 Kafka。这样网关超时不会丢任务，消费者可独立扩容。但同步权限校验、余额扣减结果或必须立即返回的数据，不应为了“架构高级”而强行异步。最终选型原则是：只有解耦、恢复和流量收益大于一致性与运维成本时才引入 MQ。
+我会特别区分几个成功：数据库提交成功、Broker ACK、消费者业务成功、Offset 提交成功不是一回事。例如积分已经更新但 Offset 尚未提交时进程崩溃，消息会再次投递，所以消费端仍然要幂等。MQ 的价值是解耦、异步和削峰，但同时引入重复、乱序、积压和最终一致性问题。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：支付成功后串行调用所有下游，任一服务超时拖垮主链路。
-paymentService.pay(orderId);
-couponClient.grant(orderId);
-smsClient.send(orderId);
-auditClient.record(orderId);
-```
+1. Broker ACK 能证明什么，不能证明什么？
+2. 为什么业务成功后才提交 Offset 仍可能重复？
 
-### 企业级改进代码
-
-```java
-// 改进：核心事务只提交事实与事件，非核心分支独立订阅。
-@Transactional
-public void confirmPayment(String orderId) {
-    paymentRepository.markPaid(orderId);
-    outboxRepository.insert(stableEventId(orderId), "PaymentConfirmed", orderId);
-}
-```
-
-### 面试官递进追问
-
-1. 削峰后积压越来越大怎么办？
-2. 哪些操作必须保留同步？
-
-### 复习记忆钩子
-
-**解耦看契约，异步看完成时延，削峰看追赶能力。**
+**记忆句：消息的一生是“发、存、取、做、记进度”。**
 
 ---
 
-## Q03. MQ 有什么缺点？什么场景不应该使用？
+## Q02. 为什么要使用消息队列？解耦、异步、削峰分别是什么？
 
-**题目定位**：场景面试题｜中等｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：高频题｜简单｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：三个词必须落到同一个业务场景
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+仍以支付成功为例。
+
+#### 1. 解耦
+
+没有 MQ 时，订单服务要知道积分、短信、审计三个服务的地址和接口。
+
+```text
+订单服务 → 积分
+        → 短信
+        → 审计
+```
+
+有 MQ 后，订单服务只发布 `PaymentConfirmed`。以后新增推荐服务，不需要修改订单服务。
+
+但解耦不是“完全没有依赖”。双方仍然依赖消息字段、版本和业务语义，这叫消息契约。
+
+#### 2. 异步
+
+用户支付成功后，不必等待短信、积分和审计全部完成。主接口先返回，后台继续处理。
+
+异步优化的是**用户等待时间**，不是让所有业务凭空执行得更快。
+
+#### 3. 削峰
+
+大促瞬间每秒产生 20,000 个请求，但数据库每秒稳定处理 3,000 个。MQ 先把请求存下来，消费者按数据库能承受的速度处理。
+
+削峰没有消灭流量，只是把瞬时压力变成了消息积压和稍后的处理时间。
+
+### 什么场景不能为了“高级”强行异步？
+
+- 权限是否通过；
+- 余额是否扣减成功；
+- 用户当前请求必须立即得到的确定结果；
+- 非常短、稳定、没有削峰需求的本地调用。
 
 ### 2～3 分钟优秀回答
 
-MQ 的主要代价有四类。第一，增加可用性依赖，Broker、网络、客户端和协调面任何一层异常都会影响链路；第二，数据从同步事务变成最终一致，需要处理双写、重复、乱序和补偿；第三，故障定位更难，一次请求会跨多个进程和时间窗口；第四，容量与成本上升，需要管理分区、副本、保留、回放、DLQ、权限和监控。
+“引入 MQ 主要解决解耦、异步和削峰三个问题。解耦是生产者只发布业务事件，不直接依赖所有下游；异步是把短信、积分、解析这类不需要在当前请求内完成的操作移到后台；削峰是先把突发请求存入 Broker，再让消费者按数据库和下游服务的稳定能力处理。
 
-不适合 MQ 的典型场景包括：用户必须在当前请求内得到强确定结果；调用非常短且上下游稳定；消息量极低但团队没有运维能力；业务无法接受最终一致；或者只是为了把一个本地函数放到另一个线程。同步查询、强校验和必须立即失败的指令，通常继续使用 RPC 或本地事务。
+例如支付成功后，订单服务只发布一条 `PaymentConfirmed`，积分、短信和审计使用不同 Consumer Group 独立订阅。这样短信服务故障不会拖垮支付主链路，新增加推荐服务也不需要修改订单服务。
 
-我的判断框架是：先明确业务不变量与 SLO，再比较同步 RPC、数据库任务表、本地线程池和 MQ。若任务必须跨进程恢复、需要削峰或多个下游独立订阅，MQ 才有明显价值。引入后必须同时设计 Outbox/Inbox、幂等、重试分类、DLQ、对账和容量，而不是只完成“能发能收”的 Demo。
+但 MQ 不是没有代价。解耦后仍有 Schema 契约，异步会带来最终一致，削峰会产生积压。所以我只在需要跨进程恢复、多下游订阅或明显流量缓冲时使用 MQ；权限校验、余额裁决等必须立即得到结果的操作仍保留同步。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：为了“微服务化”，把实时权限校验也改成异步事件。
-producer.send(new ProducerRecord<>("permission-check", userId));
-return true; // 尚未得到权限裁决就放行
+1. MQ 削峰后，积压一直增长怎么办？
+2. 异步接口应该向前端返回什么状态？
+
+**记忆句：解耦拆依赖，异步缩等待，削峰把洪水变队伍。**
+
+---
+
+## Q03. 消息队列有什么缺点？什么场景不适合使用？
+
+**题目定位**：场景题｜中等｜频率 ⭐⭐⭐⭐⭐
+
+### 先听懂：引入 MQ 是把简单问题换成分布式问题
+
+原来一次方法调用只有成功或失败。改成 MQ 后会出现：
+
+```text
+业务成功，消息没发出去
+消息发了两次
+消息顺序错了
+消费者处理成功，但 Offset 没提交
+消息积压了几百万条
+Broker 或网络故障
 ```
 
-### 企业级改进代码
+### 四类代价
 
-```java
-// 改进：同步裁决保留 RPC/本地查询，审计事件再异步化。
-boolean allowed = permissionService.check(userId, resourceId);
-if (allowed) {
-    auditOutbox.record("PermissionGranted", userId, resourceId);
-}
-return allowed;
-```
+1. **可用性依赖增加**：多了 Broker、网络、客户端和协调组件；
+2. **一致性变复杂**：本地数据库和 MQ 不能天然放进同一个事务；
+3. **排障链路变长**：一次请求跨多个进程，可能几分钟后才失败；
+4. **运维成本增加**：要管理 Topic、Partition、副本、保留期、Lag、DLQ、权限和容量。
 
-### 面试官递进追问
+### 选择前先比较四个方案
 
-1. 数据库任务表什么时候比 MQ 更合适？
-2. MQ 故障时主业务如何降级？
+- 本地同步调用；
+- RPC；
+- 数据库任务表；
+- MQ。
 
-### 复习记忆钩子
+低频后台任务、吞吐量小、只有一个消费者时，数据库任务表有时比建设 MQ 更简单。
 
-**没有银弹：先写不变量，再选同步或异步。**
+### 2～3 分钟优秀回答
+
+“MQ 的收益很大，但会降低架构的简单性。第一，它增加新的可用性依赖，Broker、网络或客户端异常都会影响链路；第二，本地事务变成最终一致，需要处理双写、重复和补偿；第三，故障定位从一次调用变成跨服务、跨时间的追踪；第四，要额外管理分区、副本、保留、积压、DLQ 和权限。
+
+不适合 MQ 的场景包括：当前请求必须立即得到强确定结果、调用本身很短且稳定、消息量很低而团队没有 MQ 运维能力，或者业务根本不能接受最终一致。例如实时权限裁决不应该先发一条消息再默认放行。
+
+我通常先写清业务不变量和 SLO，再比较同步 RPC、数据库任务表和 MQ。只有需要可靠跨进程恢复、多下游独立订阅或削峰时，MQ 的收益才明显。引入后必须同时设计可靠发布、幂等、重试、监控和对账，而不是只做到能发能收。”
+
+### 递进追问
+
+1. MQ 故障时，主业务应该失败、降级还是写本地任务表？
+2. 数据库任务表什么时候比 Kafka 更合适？
+
+**记忆句：MQ 用复杂性换解耦、恢复和吞吐。**
 
 ---
 
 ## Q04. Kafka 的 Broker、Topic、Partition、Offset、Key 分别是什么？
 
-**题目定位**：核心面试题｜简单｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：核心题｜简单｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：用“文件柜”一次记住五个词
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+```text
+Kafka 集群             = 多个仓库
+Broker                  = 一台仓库服务器
+Topic                   = 一个业务文件柜
+Partition               = 文件柜里的抽屉
+Offset                  = 抽屉内文件编号
+Key                     = 决定文件放哪个抽屉的业务标识
+```
+
+例子：
+
+```text
+Topic：order-event
+Partition 1
+├── Offset 0：O1001 创建
+├── Offset 1：O1001 支付
+└── Offset 2：O1001 发货
+```
+
+使用 `orderId` 作为 Key，可以让同一个订单在分区数不变等前提下稳定进入同一 Partition。
+
+### 三个必须说明的边界
+
+1. Offset 只在一个 Partition 内有意义，不是全局消息 ID；
+2. Kafka 保证分区内顺序，不保证 Topic 跨分区全局顺序；
+3. 扩大 Partition 数量后，Key 的映射可能改变。
 
 ### 2～3 分钟优秀回答
 
-Kafka 中，Broker 是保存分区日志并处理客户端请求的服务器；Topic 是逻辑分类；Partition 是存储、并行和局部顺序边界；Offset 是记录在某个 Partition 中的位置；Key 用于决定记录路由到哪个 Partition，并表达局部顺序实体。
+“Broker 是 Kafka 集群中的服务器节点，负责接收请求、保存分区日志和提供读取；Topic 是消息的逻辑业务分类；Partition 是 Topic 的物理分片，也是存储、并行消费和局部顺序的边界；Offset 是消息在某个 Partition 中的位置；Key 是 Producer 提供的业务标识，常用于决定消息进入哪个 Partition。
 
-例如 `agent.run.event` 有 12 个 Partition，使用 `runId` 作为 Key。相同 Run 的状态事件在分区数不变时进入同一 Partition，可以按写入顺序读取；不同 Run 分散到多个 Partition 并行处理。Consumer Group 的已提交 Offset 则记录每个 Partition 的消费进度。
+例如 `order-event` 有 6 个 Partition，我用 `orderId` 作为 Key。相同订单的创建、支付和发货事件会尽量进入同一 Partition，从而利用分区内顺序；不同订单分散到多个 Partition 并行消费。
 
-必须补充三条边界。第一，Topic 不是一条全局有序队列；第二，Offset 只在分区内有意义，不是消息的全局 ID；第三，增加 Partition 后默认 Key 映射可能变化，因此老消息与新消息可能进入不同 Partition，不能无脑在线扩分区后仍声称同一 Key 全历史有序。企业设计时要把 Topic、Partition 数、Key、保留策略和 Consumer Group 一起评审。
+Offset 还要区分消息位置和消费组提交进度。消费组提交 Offset 只是在记录下次从哪里继续，不会立即删除消息。Kafka 按保留策略清理日志，因此可以重置 Offset 回放历史消息。增加 Partition 后 Key 映射可能变化，所以顺序系统不能无脑在线扩分区。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：不设置 Key，同一 Run 的状态可能被分散到不同分区。
-producer.send(new ProducerRecord<>("agent.run.event", payload));
-```
+1. Offset 是 Producer 生成还是 Broker 分配？
+2. 为什么 Topic 不等于一条全局有序队列？
 
-### 企业级改进代码
-
-```java
-// 改进：使用稳定 runId 作为分区键。
-ProducerRecord<String, String> record =
-        new ProducerRecord<>("agent.run.event", runId, payload);
-producer.send(record);
-```
-
-### 面试官递进追问
-
-1. Offset 是谁生成的？
-2. 为什么扩 Partition 会影响 Key 映射？
-
-### 复习记忆钩子
-
-**Topic 管分类，Partition 管并行与顺序，Offset 管位置，Key 管路由。**
+**记忆句：Topic 管分类，Partition 管并行和顺序，Offset 管位置，Key 管路由。**
 
 ---
 
-## Q05. Kafka Consumer Group 与分区、消费者实例是什么关系？
+## Q05. Kafka 为什么需要 Partition？Partition 数越多越好吗？
 
-**题目定位**：高频面试题｜中等｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：高频题｜中等｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：Partition 是 Kafka 扩展能力的根
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+一个 Partition 是一条有序日志。多个 Partition 可以放在不同 Broker，并由不同 Consumer 并行读取。
+
+假设：
+
+- 单个 Consumer 每秒处理 800 条；
+- Topic 有 8 个 Partition；
+- 最多可以让约 8 个同组消费者并行负责分区。
+
+理论消费能力约为：
+
+```text
+8 × 800 = 6,400 条/秒
+```
+
+实际还会受到数据库、网络、批量大小和消息倾斜影响。
+
+### 为什么不是越多越好？
+
+Partition 增多会带来：
+
+- 更多日志文件、索引和元数据；
+- 更多副本复制流量；
+- Leader 选举和故障恢复成本；
+- Consumer Group 分配和 Rebalance 成本；
+- 小 Topic 大量分区造成资源浪费。
+
+### 初始分区数怎么估算？
+
+先看三个上限：
+
+```text
+生产需要的并行度
+消费需要的并行度
+未来一段时间的容量增长
+```
+
+再做压测，不能仅凭“10 万级 TPS”这种营销数字决定。
 
 ### 2～3 分钟优秀回答
 
-同一个 Consumer Group 内，一个 Partition 同一时刻只会分配给一个 Consumer Member；一个 Member 可以负责多个 Partition。不同 Group 可以各自消费同一 Partition 的数据，所以“同组是负载均衡，不同组是广播式独立订阅”。
+“Kafka 使用 Partition 主要为了水平扩展。一个 Topic 拆成多个 Partition 后，可以把数据分布到不同 Broker，Producer 并行写入，Consumer Group 中的多个实例也可以并行消费。同时 Kafka 的顺序保证以 Partition 为边界。
 
-如果 Topic 有 10 个 Partition，组内最多有 10 个活跃成员同时获得分区；第 11 个成员通常处于空闲状态。但不能简单说“线程数一定等于分区数”。KafkaConsumer 本身不是线程安全的，常见做法是一个消费线程持有一个 Consumer；业务处理可转交线程池，但这样会引入单分区乱序、批次部分失败和 Offset 提交困难，需要按 Partition 建串行队列或维护完成水位。
+但 Partition 不是越多越好。分区越多，日志文件、索引、副本复制、元数据、Leader 选举和 Rebalance 成本都越高。大量低流量分区还会浪费客户端和 Broker 资源。
 
-设计时我会从目标吞吐、单条处理时间、热点比例和下游承载能力反推 Partition 与实例数。扩消费者之前先看是否还有可分配 Partition，扩完还要观察 Rebalance 时长、Lag 是否下降以及 MySQL/外部 API 是否被放大流量压垮。
+我会根据目标生产吞吐、单个消费者实测能力、允许的 Lag、消息 Key 倾斜和未来增长估算初始分区数。例如目标消费 8,000 条每秒，单实例稳定处理 1,000 条，就至少需要约 8 个有效并行分区，再留合理余量并压测验证。对于严格依赖 Key 顺序的 Topic，还要评估后续扩分区造成的映射变化。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：多个线程共享同一个 KafkaConsumer，违反线程安全约束。
-KafkaConsumer<String, String> consumer = buildConsumer();
-pool.submit(() -> consumer.poll(Duration.ofSeconds(1)));
-pool.submit(() -> consumer.poll(Duration.ofSeconds(1)));
-```
+1. Topic 扩分区后，旧消息会自动迁移吗？
+2. 某个 Partition 特别忙，其他分区很闲，可能是什么原因？
 
-### 企业级改进代码
-
-```java
-// 改进：一个 poll 线程拥有 Consumer；按分区串行派发业务任务。
-while (running) {
-    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
-    records.partitions().forEach(tp ->
-        partitionExecutor(tp).submit(() -> process(records.records(tp))));
-}
-```
-
-### 面试官递进追问
-
-1. 业务线程池如何安全提交 Offset？
-2. 消费者实例多于分区会发生什么？
-
-### 复习记忆钩子
-
-**同组一分区一成员；业务并发不能破坏分区完成水位。**
+**记忆句：Partition 增加并行，也增加元数据、复制和运维成本。**
 
 ---
 
-## Q06. Kafka 为什么采用拉取？Kafka 4.x 重平衡有什么变化？
+## Q06. Consumer Group、Consumer 实例和 Partition 是什么关系？
 
-**题目定位**：高频面试题｜中等｜频率 ⭐⭐⭐⭐
+**题目定位**：必考题｜中等｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：同组是分工，不同组是各拿一份
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+Topic 有 4 个 Partition：
+
+```text
+P0 P1 P2 P3
+```
+
+消费组 A 有两个 Consumer：
+
+```text
+Consumer A1：P0、P1
+Consumer A2：P2、P3
+```
+
+如果再增加两个实例，可以一人一个 Partition；如果增加到 6 个实例，仍只有 4 个实例有分区，2 个空闲。
+
+不同消费组互不影响：
+
+```text
+积分组：完整消费 payment-event
+短信组：完整消费 payment-event
+审计组：完整消费 payment-event
+```
+
+### 为什么同组一个 Partition 不能同时交给两个普通 Consumer？
+
+这样可以简化 Offset 管理和分区内顺序。如果两个实例同时独立处理同一 Partition，就容易重复、乱序和进度冲突。
+
+### Rebalance 是什么？
+
+组成员变化时，Kafka 重新分配 Partition。频繁发布、处理时间超过 `max.poll.interval.ms`、网络不稳定都可能引发 Rebalance。
 
 ### 2～3 分钟优秀回答
 
-Kafka Consumer 主动向 Broker Fetch。拉取的优点是消费者可以按照自身能力控制批量、等待时间和处理节奏，也便于重置 Offset 回放历史；缺点是消费者必须自己处理 Poll 周期、背压、超时和进度提交。没有数据时 Kafka 使用等待机制，不是持续高频空轮询。
+“Consumer Group 用来让多个 Consumer 实例共同分摊一份 Topic 数据。在传统 Consumer Group 模型中，同一时刻，一个 Partition 只会分配给组内一个 Consumer；但一个 Consumer 可以负责多个 Partition。因此同组有效并行实例数通常不会超过 Partition 数量。
 
-Consumer Group 成员变化、订阅变化或故障会触发分区重新分配。传统全组重平衡容易造成“Stop the World”式暂停。Kafka 4.0 起，新 Consumer Rebalance Protocol 已 GA，采用增量式设计，部分心跳、会话超时和分配策略由服务端控制；客户端需配置 `group.protocol=consumer` 才启用，默认仍可能是 classic，不能说升级 Broker 后客户端自动全部切换。
+例如 Topic 有 10 个 Partition，部署 6 个同组 Consumer 时，有些实例负责两个分区；部署 10 个时可以一人一个；部署 15 个时，多出的 5 个通常空闲。不同 Consumer Group 则各自拥有独立消费进度，可以分别做积分、短信和审计。
 
-项目中，我会减少无意义扩缩容和长时间阻塞 Poll，控制 `max.poll.interval.ms`、批量大小与单批处理时间；滚动发布时观察 Rebalance 次数、分区无主时间和最老消息年龄。若业务处理不可控，会用暂停分区、外部工作队列或更细粒度完成跟踪，而不是让 Poll 线程直接卡住几分钟。
+当实例加入、退出或失联时会发生 Rebalance，Partition 重新分配。Rebalance 可能暂停消费并产生重复处理窗口，所以要控制发布抖动、处理时长和超时配置，并保证消费者幂等。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：poll 后在同一线程处理超长任务，容易超过 poll 间隔触发重平衡。
-for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(1))) {
-    callSlowModel(record.value()); // 可能执行数分钟
-}
-```
+1. 10 个 Partition、3 个 Consumer 如何分配？
+2. 为什么消费者处理太久会触发 Rebalance？
 
-### 企业级改进代码
-
-```java
-// 改进：限制批量并暂停对应分区，业务完成后再恢复。
-ConsumerRecords<String, String> batch = consumer.poll(Duration.ofMillis(500));
-Set<TopicPartition> assigned = batch.partitions();
-consumer.pause(assigned);
-processWithBoundedDeadline(batch);
-consumer.commitSync();
-consumer.resume(assigned);
-```
-
-### 面试官递进追问
-
-1. 新协议是否默认启用？
-2. Rebalance 为什么可能导致重复消费？
-
-### 复习记忆钩子
-
-**拉取让消费者控节奏；重平衡要控停顿、进度和重复。**
+**记忆句：同组分摊，不同组广播；并行上限先看分区数。**
 
 ---
 
-## Q07. Kafka 如何保证消息顺序？
+## Q07. Kafka 为什么使用拉取模型，而不是 Broker 主动推送？
 
-**题目定位**：高频面试题｜中等｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：高频题｜中等｜频率 ⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：让工人自己决定一次搬多少货
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+如果 Broker 主动极速推送，而某个 Consumer 处理很慢，消费者内存和网络可能被塞满。
+
+Kafka 让 Consumer 主动 Fetch：
+
+```text
+Consumer：我现在能处理一批消息。
+Broker：返回可读取的数据。
+Consumer：处理完成后再来取下一批。
+```
+
+### 拉取的优势
+
+- 消费者控制处理节奏；
+- 容易批量读取，提高吞吐；
+- 可以通过 Offset 回放；
+- 不同消费者可以有不同进度。
+
+### 没有消息会不会不断空轮询？
+
+Kafka 支持等待和批量相关参数。Broker 可以在暂时没有足够数据时等待一段时间再返回，这属于长轮询思路。
+
+### 拉取也不是自动背压
+
+如果每次拉 500 条，但业务线程处理一批需要 10 分钟，仍可能超过 Poll 间隔、触发 Rebalance。应用需要控制 `max.poll.records`、处理时长、暂停与恢复分区等。
 
 ### 2～3 分钟优秀回答
 
-Kafka 的基础保证是单 Partition 日志有序。要获得业务顺序，需要生产端、Broker 和消费端同时满足条件：同一业务实体使用稳定 Key 进入同一 Partition；Producer 在重试时保持幂等与顺序；消费者对该 Partition 按顺序完成业务并按完成水位提交 Offset。
+“Kafka Consumer 采用主动拉取模型。这样消费者可以根据自己的处理能力决定何时拉取和一次获取多少数据，适合批量处理，也避免 Broker 不顾消费者能力持续推送导致网络拥塞或内存溢出。
 
-全局顺序通常意味着单 Partition、单消费流水线，吞吐和可用性代价很高。企业项目更常用局部顺序，例如同一 `orderId`、`runId` 或 `documentId` 有序，不同实体并行。即便记录读取顺序正确，把同一 Partition 的记录无约束地扔给线程池，也可能先完成后面的状态，造成业务乱序。
+拉取还使消费进度由 Consumer Group 的 Offset 表达，消费者可以重置 Offset 回放历史数据。没有数据时并不是毫无间隔地空转，Fetch 请求可以等待数据或超时返回。
 
-还要处理迟到与重复：事件携带 `aggregateVersion`，数据库使用条件更新 `where version = expectedVersion`，旧事件不能让状态倒退。增加 Partition、修改 Key 或多 Producer 并发都可能破坏原有假设，所以顺序是端到端设计，不是一句“Kafka 分区有序”。
+不过拉取不代表天然没有背压问题。如果 Consumer 一次拉太多，或者数据库、模型服务处理过慢，仍会出现本地堆积、Poll 超时和 Rebalance。项目中要结合批量大小、单批处理时间、暂停恢复和 Lag 监控控制消费节奏。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：同一分区消息并发处理，PAID 可能先于 CREATED 落库。
-records.forEach(record -> pool.submit(() -> updateOrder(record.value())));
-```
+1. `max.poll.records` 降低后吞吐一定下降吗？
+2. Consumer 本地线程池堆积时应该继续 Poll 吗？
 
-### 企业级改进代码
-
-```java
-// 改进：同一分区串行，并用版本条件更新阻止状态倒退。
-for (ConsumerRecord<String, OrderEvent> record : partitionRecords) {
-    OrderEvent e = record.value();
-    int changed = orderRepo.advance(e.orderId(), e.fromVersion(), e.toVersion());
-    if (changed == 0) reconcile(e);
-}
-```
-
-### 面试官递进追问
-
-1. 幂等 Producer 是否等于业务顺序？
-2. 扩分区后怎样迁移顺序 Key？
-
-### 复习记忆钩子
-
-**同 Key 同分区，单分区按完成顺序推进，版本防迟到。**
+**记忆句：拉取把节奏交给消费者，但消费者仍要自己做好背压。**
 
 ---
 
-## Q08. Kafka 为什么快？
+## Q08. Kafka 如何保证消息顺序？为什么只能保证分区内顺序？
 
-**题目定位**：高频面试题｜中等｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：必考题｜中等偏上｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：多个收银台只能各自排队
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+```text
+Partition 0：A1 → A2 → A3
+Partition 1：B1 → B2 → B3
+```
+
+每个 Partition 内是追加日志，所以能保留写入次序；不同 Partition 并行工作，没有统一的全局时钟决定谁先完成。
+
+### 保证同一订单顺序的三个条件
+
+1. Producer 使用 `orderId` 作为 Key，让同订单进入同一 Partition；
+2. Producer 对同一订单的发送本身要有确定顺序；
+3. Consumer 对同一 Partition 的业务处理不能被普通线程池打乱完成次序。
+
+### 仅仅单线程消费就够了吗？
+
+还不够。消息可能重复、迟到或业务版本倒退，所以数据库还应使用状态机或版本号：
+
+```sql
+UPDATE orders
+SET status = 'SHIPPED', version = 3
+WHERE order_id = 'O1001'
+  AND version = 2
+  AND status = 'PAID';
+```
+
+### 全局顺序怎么办？
+
+所有消息放一个 Partition，单消费者串行处理，但吞吐和可用性明显下降。企业系统更常使用“同订单有序、订单之间并行”。
 
 ### 2～3 分钟优秀回答
 
-Kafka 高吞吐不是某一个“零拷贝黑科技”，而是多项设计叠加。第一，Partition 日志主要追加写，减少随机写与锁竞争；第二，Producer、Broker、Consumer 都以 Record Batch 为核心，摊薄系统调用和网络开销；第三，批量压缩减少网络与磁盘字节；第四，充分利用操作系统 Page Cache；第五，读取路径可利用高效文件到网络传输机制；第六，多 Partition 和多 Broker 提供水平并行。
+“Kafka 天然保证同一个 Partition 内的日志顺序，不保证不同 Partition 的全局顺序。要保证同一订单事件有序，我会把 `orderId` 作为 Key，让该订单的创建、支付、发货事件在分区数不变等前提下进入同一 Partition；Producer 要按业务顺序发送，Consumer 也不能在收到后用无序线程池并发完成同一分区消息。
 
-面试中不能把“顺序写磁盘一定比内存快”或“全程零 CPU 拷贝”当结论。实际性能受消息大小、批量、压缩算法、`linger.ms`、磁盘、网络、副本数、确认级别、Partition 数和热点影响。Kafka 4.x Producer 默认批处理等待参数也有变化，必须按版本确认。
+如果业务要求全局顺序，可以只使用一个 Partition 并串行消费，但会牺牲吞吐和扩展能力，所以更常见的是局部顺序：同一订单有序，不同订单并行。
 
-项目优化顺序应是先测，再调。观察平均批次字节、压缩率、Request Queue、磁盘吞吐、网络、Produce/Fetch P99、GC 和热点分区。提高 `linger.ms` 或批次可能提升吞吐，却增加低流量延迟和内存占用；增加 Partition 提升并行，却增加元数据、文件句柄和重平衡成本。
+另外消息队列顺序不能替代业务状态机。即使 Broker 按序投递，重复、回放或旧版本消息仍可能出现。数据库应通过状态条件和版本号防止状态从 SHIPPED 倒退到 PAID。”
 
-### 可读但会制造事故的 Java 反例
+### 递进追问
 
-```java
-// 反例：每条消息立即 flush，彻底破坏批处理。
-for (Event event : events) {
-    producer.send(toRecord(event)).get();
-    producer.flush();
-}
-```
+1. 扩 Partition 后，同一 Key 的顺序为什么可能受影响？
+2. 一个 Partition 内使用线程池，怎样保持相同 Key 的处理顺序？
 
-### 企业级改进代码
-
-```java
-// 改进：异步发送并在批次边界统一等待结果。
-List<Future<RecordMetadata>> futures = new ArrayList<>();
-for (Event event : events) futures.add(producer.send(toRecord(event)));
-for (Future<RecordMetadata> future : futures) future.get();
-```
-
-### 面试官递进追问
-
-1. `linger.ms` 增大有什么代价？
-2. 压缩为什么按批次更有效？
-
-### 复习记忆钩子
-
-**追加写、批处理、压缩、Page Cache、并行共同换吞吐。**
+**记忆句：同 Key 进同分区，分区内串行完成，数据库版本做最终裁决。**
 
 ---
 
-## Q09. Kafka 的日志保留、回放和“消费后不删除”如何理解？
+## Q09. Kafka 为什么吞吐量高？
 
-**题目定位**：高频面试题｜中等｜频率 ⭐⭐⭐⭐
+**题目定位**：高频原理题｜中等｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：不是因为一个“零拷贝”词，而是一组设计共同作用
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+Kafka 快的核心组合：
+
+1. **顺序追加日志**：减少随机写；
+2. **批量**：多条消息一次网络和磁盘处理；
+3. **Page Cache**：利用操作系统缓存文件页；
+4. **零拷贝路径**：发送已有日志时减少用户态和内核态之间的数据搬运；
+5. **分区并行**：多个 Broker、Partition、Consumer 同时工作；
+6. **压缩**：按批次压缩，减少网络和磁盘数据量。
+
+### 批量为什么很重要？
+
+发送 1,000 条消息，如果每条一次网络请求，会有 1,000 次固定开销。合成若干 Batch 后，请求次数和系统调用次数显著减少。
+
+### 顺序写是否永远等于顺序磁盘 I/O？
+
+不能绝对化。大量 Partition、多个文件并发、系统刷盘和磁盘调度都会影响实际 I/O。但追加日志仍是 Kafka 高吞吐的重要基础。
 
 ### 2～3 分钟优秀回答
 
-Kafka 是分布式日志，不会因为某个 Consumer Group 提交 Offset 就立刻删除记录。消息按 Topic 的保留时间、保留大小和清理策略进行段级清理；不同 Consumer Group 有各自进度，因此同一份日志可以被审计、索引、评估等多个组独立读取。
+“Kafka 高吞吐不是单靠零拷贝，而是多种设计叠加。第一，Partition 采用追加日志，主要进行顺序写；第二，Producer 和 Consumer 都大量使用 Batch，降低网络请求、系统调用和磁盘操作的固定开销；第三，充分利用操作系统 Page Cache；第四，Broker 向网络发送已有日志数据时可以使用减少拷贝的传输路径；第五，多 Partition 分布到多个 Broker，实现水平并行；第六，按批次压缩降低网络和磁盘量。
 
-回放就是把某个 Group 的 Offset 重置到较早位置，或使用新 Group 从指定位置读取。它适合重建搜索索引、修复投影和重新计算，但前提是消费者具备幂等性，外部副作用不能随意重放。例如工具执行或发短信事件回放前必须进入模拟模式、查询 operationId 或使用专门的派生事件。
+这些优化也有取舍。提高 `linger.ms` 和 Batch 可以提升吞吐，但增加低流量时延；压缩节省带宽但增加 CPU；分区过多会增加文件、元数据和故障恢复成本。所以项目中要用真实消息大小和可靠配置压测吞吐、P99 和资源，而不是直接背单机百万 TPS。”
 
-`delete` 保留原始时间流，`compact` 保留每个 Key 的较新值并处理 tombstone，两者也可组合。Kafka 不是永久档案系统，超过保留期的数据仍会消失；关键业务真相应在数据库或对象存储，Kafka 负责事件流与可重放窗口。
+### 递进追问
 
-### 可读但会制造事故的 Java 反例
+1. `linger.ms` 增大为什么可能提高吞吐？
+2. 零拷贝减少了哪一段数据复制？
 
-```java
-// 反例：直接把生产消费组 Offset 重置到最早，重复执行外部工具。
-admin.resetOffsets("tool-executor", "earliest");
-```
-
-### 企业级改进代码
-
-```java
-// 改进：使用隔离回放组，并让副作用消费者进入 dry-run/查询模式。
-String replayGroup = "tool-audit-replay-" + LocalDate.now();
-ReplayPolicy policy = ReplayPolicy.auditOnly();
-replayService.start(replayGroup, targetOffsets, policy);
-```
-
-### 面试官递进追问
-
-1. Log Compaction 是否保存所有历史？
-2. 回放为什么必须隔离 Consumer Group？
-
-### 复习记忆钩子
-
-**Offset 是读者书签，Retention 才决定日志何时清理。**
+**记忆句：顺序日志、批量、缓存、少拷贝、分区并行、压缩。**
 
 ---
 
-## Q10. Kafka 如何通过 KRaft、副本、ISR 和 Leader 选举实现高可用？
+## Q10. Kafka 如何实现高可用？Broker 宕机后发生什么？
 
-**题目定位**：高频面试题｜中等偏上｜频率 ⭐⭐⭐⭐⭐
+**题目定位**：高频题｜中等偏上｜频率 ⭐⭐⭐⭐⭐
 
-### 为什么现在问这道题？
+### 先听懂：高可用解决两个问题
 
-这道题位于从“会使用 MQ”走向“能解释失败窗口”的关键位置。回答时必须依次覆盖：结论与边界、项目场景、底层机制、故障与恢复、监控验证、方案取舍。
+1. 一台机器坏了，服务能继续；
+2. 一台机器坏了，已确认的数据尽量不丢。
 
-### 2～3 分钟优秀回答
+Kafka 通过 Partition 副本实现：
 
-Kafka 4.x 只使用 KRaft 管理集群元数据。Controller Quorum 负责 Broker、Topic、Partition、Leader 和配置等元数据决策；数据面每个 Partition 有一个 Leader 和多个 Follower。Follower 持续复制 Leader 日志，满足同步条件的副本进入 ISR。
-
-当 Leader Broker 故障，Controller 从符合资格的副本中选择新 Leader，客户端刷新元数据后继续读写。可靠性不能只看副本因子。例如常见生产组合是副本因子 3、`min.insync.replicas=2`、Producer `acks=all`；ISR 低于最小值时宁可拒绝写入，换取更低数据丢失风险。Kafka 4.1 起新集群默认启用 ELR 等机制时，选主语义还需按版本理解。
-
-高可用意味着取舍：允许非同步副本强行当 Leader 可以提高可用性，却可能丢数据；严格 ISR 会在故障期间拒写。项目要根据 RPO/RTO 决定，并做 Broker 宕机、Controller 切换、机架故障和磁盘满演练，验证 Leader 切换时间、错误率和数据一致性。
-
-### 可读但会制造事故的 Java 反例
-
-```properties
-# 反例：副本只有 1，任何 Broker 故障都可能导致不可用或数据风险。
-replication.factor=1
-min.insync.replicas=1
+```text
+Partition 0
+├── Broker 1：Leader
+├── Broker 2：Follower
+└── Broker 3：Follower
 ```
 
-### 企业级改进代码
+Producer 和 Consumer 访问 Leader，Follower 持续复制。Leader 宕机后，KRaft Controller 从合格副本中选择新 Leader，并更新集群元数据；客户端刷新元数据后连接新 Leader。
 
-```properties
-# 改进示例：需结合真实集群和 RPO 压测。
-replication.factor=3
+### 为什么有副本仍可能丢数据？
+
+如果配置为 `acks=1`，Leader 写入后立刻确认，但 Follower 还没复制，Leader 就宕机，最新消息可能丢失。
+
+企业可靠组合通常包括：
+
+```text
+副本数 3
+acks=all
 min.insync.replicas=2
-unclean.leader.election.enable=false
+跨 Broker / 跨机架放置副本
+禁止不安全 Leader 选举
+磁盘、ISR、Under-replicated Partition 告警
 ```
 
-### 面试官递进追问
+### 可用性与一致性的取舍
 
-1. KRaft Controller 是否保存业务消息？
-2. ISR 小于 min ISR 时为什么拒写？
+当同步副本不足时：
 
-### 复习记忆钩子
+- 继续单副本写入：可用性高，但风险增加；
+- 拒绝写入：可靠性高，但业务暂时不可用。
 
-**KRaft 管元数据，副本管数据；严格 ISR 用可用性换 RPO。**
+### 2～3 分钟优秀回答
 
----
+“Kafka 高可用的基础是 Partition 多副本。每个 Partition 有一个 Leader 和多个 Follower，客户端读写 Leader，Follower 持续复制。Leader 所在 Broker 故障后，KRaft Controller 会从具备资格的副本中选出新 Leader，客户端刷新元数据后继续读写。
+
+但副本数不等于绝对不丢。生产可靠性还取决于 `acks`、ISR 和 `min.insync.replicas`。例如副本数 3、`acks=all`、最少同步副本 2，当只剩一个同步副本时拒绝写入，避免以单副本状态继续确认。副本还应跨机器和机架部署，并禁止从严重落后的副本做不安全选主。
+
+运维上要监控离开 ISR 的副本、Under-replicated Partition、磁盘水位、Controller 状态和故障恢复时间。高可用本质上是多副本、自动选主、客户端路由刷新和监控演练的组合。”
+
+### 递进追问
+
+1. `acks=all` 是等待所有配置副本，还是满足同步副本条件？
+2. 为什么同步副本不足时拒绝写入反而是可靠性设计？
+
+**记忆句：副本保数据，Controller 换 Leader，客户端刷新路由，配置决定确认边界。**
