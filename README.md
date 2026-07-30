@@ -2,6 +2,10 @@
 
 面向 Agent 应用开发、Java 后端、RAG 与 AI 平台岗位的企业级面试教材仓库。
 
+## 教材目录
+
+- [Java 核心、集合、并发、JVM 与 Spring：初学者到大厂高薪岗位教材](docs/java-core-spring/README.md)
+
 ## 教材原则
 
 - 从初学者术语与工程直觉开始；
